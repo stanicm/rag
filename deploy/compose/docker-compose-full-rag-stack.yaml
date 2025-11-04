@@ -1,0 +1,457 @@
+version: '3.8'
+
+networks:
+  nvidia-rag:
+    driver: bridge
+
+services:
+  # ==========================================
+  # VECTOR DATABASE LAYER (Start First)
+  # ==========================================
+  
+  milvus-etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - nvidia-rag
+
+  milvus-minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - nvidia-rag
+
+  milvus-standalone:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.4.13
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      milvus-etcd:
+        condition: service_healthy
+      milvus-minio:
+        condition: service_healthy
+    networks:
+      - nvidia-rag
+
+  # ==========================================
+  # NVIDIA NIMs LAYER (Start After Vector DB)
+  # ==========================================
+
+  nim-llm:
+    container_name: nim-llm-ms
+    image: nvcr.io/nim/nvidia/nvidia-nemotron-nano-9b-v2:latest
+    shm_size: 16GB
+    volumes:
+      - ${MODEL_DIRECTORY:-~/.cache/model-cache}:/opt/nim/.cache
+    user: "${USERID:-1000}"
+    ports:
+      - "8999:8000"
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+      # Memory Optimization Parameters (120K context)
+      NIM_MAX_BATCH_SIZE: 1
+      NIM_MAX_MODEL_LEN: 120000
+      NIM_KVCACHE_PERCENT: 0.6
+      NIM_LOW_MEMORY_MODE: 1
+      NIM_KV_CACHE_HOST_MEM_FRACTION: 0.6
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import requests; requests.get('http://localhost:8000/v1/health/ready')"]
+      interval: 30s
+      timeout: 20s
+      retries: 100
+      start_period: 600s
+    depends_on:
+      milvus-standalone:
+        condition: service_healthy
+    networks:
+      - nvidia-rag
+
+  nemoretriever-embedding-ms:
+    container_name: nemoretriever-embedding-ms
+    image: nvcr.io/nim/nvidia/llama-3.2-nv-embedqa-1b-v2:1.10.0
+    shm_size: 16GB
+    volumes:
+      - ${MODEL_DIRECTORY:-~/.cache/model-cache}:/opt/nim/.cache
+    ports:
+      - "9080:8000"
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+      NIM_TRT_ENGINE_HOST_CODE_ALLOWED: 1
+    user: "${USERID:-1000}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health/ready"]
+      interval: 30s
+      timeout: 20s
+      retries: 100
+      start_period: 300s
+    depends_on:
+      milvus-standalone:
+        condition: service_healthy
+    networks:
+      - nvidia-rag
+
+  nemoretriever-ranking-ms:
+    container_name: nemoretriever-ranking-ms
+    image: nvcr.io/nim/nvidia/nv-rerankqa-mistral-4b-v3:1.10.0
+    shm_size: 16GB
+    volumes:
+      - ${MODEL_DIRECTORY:-~/.cache/model-cache}:/opt/nim/.cache
+    ports:
+      - "1976:8000"
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+    user: "${USERID:-1000}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health/ready"]
+      interval: 30s
+      timeout: 20s
+      retries: 100
+      start_period: 300s
+    depends_on:
+      milvus-standalone:
+        condition: service_healthy
+    networks:
+      - nvidia-rag
+
+  # ==========================================
+  # EXTRACTION NIMs (Document Processing)
+  # ==========================================
+
+  page-elements:
+    container_name: page-elements
+    image: nvcr.io/nim/nvidia/nemoretriever-page-elements-v2:1.5.0
+    shm_size: 16gb
+    ports:
+      - "8012:8000"
+      - "8013:8001"
+      - "8014:8002"
+    user: root
+    environment:
+      - NIM_HTTP_API_PORT=8000
+      - NIM_TRITON_LOG_VERBOSE=1
+      - NIM_TRITON_RATE_LIMIT=3
+      - NGC_API_KEY=${NGC_API_KEY}
+      - CUDA_VISIBLE_DEVICES=0
+      - NIM_TRITON_MAX_BATCH_SIZE=32
+      - NIM_TRITON_CUDA_MEMORY_POOL_MB=2048
+      - NIM_TRITON_CPU_THREADS_PRE_PROCESSOR=2
+      - NIM_TRITON_CPU_THREADS_POST_PROCESSOR=1
+      - OMP_NUM_THREADS=2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    runtime: nvidia
+    depends_on:
+      milvus-standalone:
+        condition: service_healthy
+    networks:
+      - nvidia-rag
+
+  graphic-elements:
+    container_name: graphic-elements
+    image: nvcr.io/nim/nvidia/nemoretriever-graphic-elements-v1:1.5.0
+    shm_size: 16gb
+    ports:
+      - "8003:8000"
+      - "8004:8001"
+      - "8005:8002"
+    user: root
+    environment:
+      - NIM_HTTP_API_PORT=8000
+      - NIM_TRITON_LOG_VERBOSE=1
+      - NIM_TRITON_RATE_LIMIT=3
+      - NGC_API_KEY=${NGC_API_KEY}
+      - CUDA_VISIBLE_DEVICES=0
+      - NIM_TRITON_MAX_BATCH_SIZE=32
+      - NIM_TRITON_CUDA_MEMORY_POOL_MB=2048
+      - OMP_NUM_THREADS=1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    runtime: nvidia
+    depends_on:
+      milvus-standalone:
+        condition: service_healthy
+    networks:
+      - nvidia-rag
+
+  table-structure:
+    container_name: table-structure
+    image: nvcr.io/nim/nvidia/nemoretriever-table-structure-v1:1.5.0
+    shm_size: 16gb
+    ports:
+      - "8006:8000"
+      - "8007:8001"
+      - "8008:8002"
+    user: root
+    environment:
+      - NIM_HTTP_API_PORT=8000
+      - NIM_TRITON_LOG_VERBOSE=1
+      - NIM_TRITON_RATE_LIMIT=3
+      - NGC_API_KEY=${NGC_API_KEY}
+      - CUDA_VISIBLE_DEVICES=0
+      - NIM_TRITON_MAX_BATCH_SIZE=32
+      - NIM_TRITON_CUDA_MEMORY_POOL_MB=2048
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    runtime: nvidia
+    depends_on:
+      milvus-standalone:
+        condition: service_healthy
+    networks:
+      - nvidia-rag
+
+  paddleocr:
+    container_name: paddleocr
+    image: nvcr.io/nim/baidu/paddleocr:1.5.0
+    shm_size: 16gb
+    ports:
+      - "8009:8000"
+      - "8010:8001"
+      - "8011:8002"
+    user: root
+    environment:
+      - OMP_NUM_THREADS=8
+      - NIM_HTTP_API_PORT=8000
+      - NIM_TRITON_LOG_VERBOSE=1
+      - NGC_API_KEY=${NGC_API_KEY}
+      - CUDA_VISIBLE_DEVICES=0
+      - NIM_TRITON_RATE_LIMIT=3
+      - NIM_TRITON_CUDA_MEMORY_POOL_MB=3072
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    runtime: nvidia
+    depends_on:
+      milvus-standalone:
+        condition: service_healthy
+    networks:
+      - nvidia-rag
+
+  # ==========================================
+  # INGESTOR SERVICES
+  # ==========================================
+
+  redis:
+    container_name: redis
+    image: redis:7.4.1
+    ports:
+      - "6379:6379"
+    networks:
+      - nvidia-rag
+
+  nv-ingest-ms-runtime:
+    container_name: nv-ingest-ms-runtime
+    image: nvcr.io/nvidia/nemo-microservices/nv-ingest-ms-runtime:0.6.1
+    volumes:
+      - ${MODEL_DIRECTORY:-~/.cache/model-cache}:/opt/nim/.cache
+    ports:
+      - "7670:7670"
+      - "7671:7671"
+    user: root
+    environment:
+      NGC_API_KEY: ${NGC_API_KEY}
+      MESSAGE_CLIENT_HOST: redis
+      MESSAGE_CLIENT_PORT: 6379
+      NIM_EMBEDDINGS_URL: http://nemoretriever-embedding-ms:8000/v1
+      NIM_PADDLEOCR_URL: http://paddleocr:8000/v1
+      NIM_PAGE_ELEMENTS_URL: http://page-elements:8000/v1
+      NIM_TABLE_ELEMENTS_URL: http://table-structure:8000/v1
+      NIM_GRAPHIC_ELEMENTS_URL: http://graphic-elements:8000/v1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    runtime: nvidia
+    depends_on:
+      - redis
+      - nemoretriever-embedding-ms
+      - paddleocr
+      - page-elements
+      - table-structure
+      - graphic-elements
+    networks:
+      - nvidia-rag
+
+  ingestor-server:
+    container_name: ingestor-server
+    image: nvcr.io/ohlfw0olaadg/ea-participants/nemo-retriever-ingestor-service:0.6.1
+    ports:
+      - "8082:8082"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      NIM_PROCESSING_URL: http://nv-ingest-ms-runtime:7670
+      MILVUS_HOST: milvus-standalone
+      MILVUS_PORT: 19530
+    depends_on:
+      - redis
+      - nv-ingest-ms-runtime
+      - milvus-standalone
+    networks:
+      - nvidia-rag
+
+  # ==========================================
+  # RAG SERVER & FRONTEND
+  # ==========================================
+
+  rag-server:
+    container_name: rag-server
+    image: nvcr.io/ohlfw0olaadg/ea-participants/nemo-retriever-rag-service:0.6.1
+    ports:
+      - "8081:8081"
+    environment:
+      # LLM Configuration (Nemotron Nano 9B)
+      APP_LLM_SERVERURL: http://nim-llm:8000/v1
+      APP_LLM_MODELNAME: nvidia/nvidia-nemotron-nano-9b-v2
+      APP_LLM_MODELENGINE: nvidia-ai-endpoints
+      
+      # Query Rewriter (uses same LLM)
+      APP_QUERYREWRITER_MODELNAME: nvidia/nvidia-nemotron-nano-9b-v2
+      APP_QUERYREWRITER_SERVERURL: http://nim-llm:8000/v1
+      APP_QUERYREWRITER_MODELENGINE: nvidia-ai-endpoints
+      
+      # Filter Expression Generator (uses same LLM)
+      APP_FILTEREXPRESSIONGENERATOR_MODELNAME: nvidia/nvidia-nemotron-nano-9b-v2
+      APP_FILTEREXPRESSIONGENERATOR_SERVERURL: http://nim-llm:8000/v1
+      APP_FILTEREXPRESSIONGENERATOR_MODELENGINE: nvidia-ai-endpoints
+      
+      # Embeddings Configuration
+      APP_EMBEDDINGS_SERVERURL: http://nemoretriever-embedding-ms:8000/v1
+      APP_EMBEDDINGS_MODELNAME: nvidia/nv-embedqa-mistral-7b-v2
+      APP_EMBEDDINGS_MODELENGINE: nvidia-ai-endpoints
+      
+      # Ranking Configuration
+      APP_RANKING_SERVERURL: http://nemoretriever-ranking-ms:8000/v1
+      APP_RANKING_MODELNAME: nvidia/nv-rerankqa-mistral-4b-v3
+      APP_RANKING_MODELENGINE: nvidia-ai-endpoints
+      
+      # Vector Store Configuration
+      APP_VECTORSTORE_NAME: milvus
+      APP_VECTORSTORE_URL: http://milvus-standalone:19530
+      
+      # General Settings
+      APP_TEXTSPLITTER_CHUNKSIZE: 510
+      APP_TEXTSPLITTER_CHUNKOVERLAP: 200
+      COLLECTION_NAME: default
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      ENABLE_TRACING: false
+    depends_on:
+      nim-llm:
+        condition: service_healthy
+      nemoretriever-embedding-ms:
+        condition: service_healthy
+      nemoretriever-ranking-ms:
+        condition: service_healthy
+      milvus-standalone:
+        condition: service_healthy
+    networks:
+      - nvidia-rag
+
+  rag-frontend:
+    container_name: rag-frontend
+    image: nvcr.io/ohlfw0olaadg/ea-participants/nemo-retriever-rag-ui:0.6.1
+    ports:
+      - "8090:3000"
+    environment:
+      APP_SERVERURL: http://rag-server
+      APP_SERVERPORT: 8081
+      APP_MODELNAME: nvidia/nvidia-nemotron-nano-9b-v2
+      RIVA_API_URI: ""
+      RIVA_API_KEY: ""
+      RIVA_FUNCTION_ID: ""
+      TTS_SAMPLE_RATE: 48000
+    depends_on:
+      - rag-server
+    networks:
+      - nvidia-rag
+
